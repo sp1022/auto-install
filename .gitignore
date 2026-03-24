@@ -1,0 +1,13 @@
+.gocache/
+.claude/
+
+deploy.conf
+coverage.out
+*.log
+deploy-*.log
+
+pg-deploy
+pg-deploy-debian-amd64
+pg-deploy-*
+
+.rollback_state
