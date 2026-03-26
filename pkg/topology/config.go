@@ -424,10 +424,8 @@ restapi:
   connect_address: {{ .Node.Host }}:8008
 
 etcd3:
-  hosts:
-{{ range .EtcdEndpoints }}
-    - {{ . }}
-{{ end }}
+  hosts: "{{ join .EtcdEndpoints "," }}"
+  protocol: "http"
 
 postgresql:
   listen: 0.0.0.0:{{ .Node.Port }}
@@ -441,8 +439,8 @@ postgresql:
       password: "{{ .ReplicationPassword }}"
 
   parameters:
-    max_connections: 200
-    shared_buffers: 256MB
+    max_connections: 50
+    shared_buffers: 64MB
     wal_level: logical
     hot_standby: on
     max_wal_senders: 10

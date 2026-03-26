@@ -11,7 +11,7 @@ import (
 
 var (
 	// Version 版本号
-	Version = "2.0.0-alpha"
+	Version = "2.0.0"
 	// BuildDate 构建日期
 	BuildDate = "2026-03-16"
 )

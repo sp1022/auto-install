@@ -1,0 +1,66 @@
+# Patroni 配置文件示例
+# 此文件用于 Patroni 模式的配置化管理
+
+# etcd 配置
+etcd_hosts: "192.168.1.10:2379,192.168.1.11:2379,192.168.1.12:2379"
+etcd_protocol: "http"  # http 或 https
+etcd_cacert: ""       # HTTPS 时需要
+etcd_cert: ""         # HTTPS 时需要
+etcd_key: ""          # HTTPS 时需要
+
+# REST API 配置
+restapi_port: 8008
+restapi_listen: "0.0.0.0:8008"
+
+# PostgreSQL 参数
+pg_parameters:
+  max_connections: "2000"
+  shared_buffers: "16384MB"
+  wal_level: "replica"
+  max_wal_senders: "20"
+  max_replication_slots: "20"
+  hot_standby: "on"
+  wal_log_hints: "on"
+  max_slot_wal_keep_size: "32GB"
+
+# Citus 配置（如果启用）
+enable_citus: true
+citus_group: 0
+citus_database: "postgres"
+
+# 复制配置
+replication_user: "replicator"
+replication_password: ""  # 留空则自动生成
+
+# Bootstrap 配置
+bootstrap_encoding: "UTF8"
+bootstrap_locale: "en_US.UTF-8"
+bootstrap_data_checksums: "on"
+
+# DCS (Distributed Configuration Store) 配置
+dcs_ttl: 30
+dcs_loop_wait: 10
+dcs_retry_timeout: 10
+dcs_maximum_lag_on_failover: 1048576
+dcs_master_start_timeout: 300
+dcs_primary_start_timeout: 300
+dcs_replica_start_timeout: 300
+dcs_synchronous_mode: true
+dcs_synchronous_node_count: 1
+
+# 日志配置
+log_destination: "/data/pglog"
+log_filename: "postgresql-%%Y-%%m-%%d.log"
+log_checkpoints: "on"
+log_directory: "/data/pglog"
+
+# PG_HBA 规则
+pg_hba:
+  - "local all all trust"
+  - "host all all 127.0.0.1/32 trust"
+  - "host all all ::1/128 trust"
+  - "local replication all trust"
+  - "host replication all 127.0.0.1/32 trust"
+  - "host replication all ::1/128 trust"
+  - "host all all 0.0.0.0/0 md5"
+  - "host replication all 0.0.0.0/0 md5"

@@ -55,6 +55,11 @@ type Config struct {
 	PGSoftDir       string // PostgreSQL 安装目录
 	PGConfigureOpts string // PostgreSQL configure 选项
 
+	// Patroni/etcd 离线安装包
+	PatroniPackage    string // 包含 python3、patroni、patronictl 的离线运行时 tar.gz
+	PatroniWheelhouse string // Debian 优先：离线 wheelhouse tar.gz
+	EtcdPackage       string // 可选，包含 etcd、etcdctl 的离线运行时 tar.gz
+
 	// 扩展配置
 	Extensions []string // 如 citus, pg_stat_statements
 
@@ -132,6 +137,7 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg.ApplyEnvironment()
+	cfg.resolveArtifactPaths()
 
 	// 验证配置
 	if err := cfg.Validate(); err != nil {
@@ -167,6 +173,12 @@ func (c *Config) parseField(key, value string) error {
 		c.PGSoftDir = value
 	case "pg_configure_opts":
 		c.PGConfigureOpts = value
+	case "patroni_package":
+		c.PatroniPackage = value
+	case "patroni_wheelhouse":
+		c.PatroniWheelhouse = value
+	case "etcd_package":
+		c.EtcdPackage = value
 	case "extensions":
 		if value != "" {
 			c.Extensions = strings.Split(value, ",")
@@ -438,6 +450,24 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if c.PatroniPackage != "" {
+		if _, err := os.Stat(c.PatroniPackage); os.IsNotExist(err) {
+			return fmt.Errorf("patroni_package file not found: %s", c.PatroniPackage)
+		}
+	}
+
+	if c.PatroniWheelhouse != "" {
+		if _, err := os.Stat(c.PatroniWheelhouse); os.IsNotExist(err) {
+			return fmt.Errorf("patroni_wheelhouse file not found: %s", c.PatroniWheelhouse)
+		}
+	}
+
+	if c.EtcdPackage != "" {
+		if _, err := os.Stat(c.EtcdPackage); os.IsNotExist(err) {
+			return fmt.Errorf("etcd_package file not found: %s", c.EtcdPackage)
+		}
+	}
+
 	if err := validateManagedPath("pg_soft_dir", c.PGSoftDir); err != nil {
 		return err
 	}
@@ -553,6 +583,15 @@ func (c *Config) Save(path string) error {
 	if c.PGConfigureOpts != "" {
 		fmt.Fprintf(file, "pg_configure_opts: %s\n", c.PGConfigureOpts)
 	}
+	if c.PatroniPackage != "" {
+		fmt.Fprintf(file, "patroni_package: %s\n", c.PatroniPackage)
+	}
+	if c.PatroniWheelhouse != "" {
+		fmt.Fprintf(file, "patroni_wheelhouse: %s\n", c.PatroniWheelhouse)
+	}
+	if c.EtcdPackage != "" {
+		fmt.Fprintf(file, "etcd_package: %s\n", c.EtcdPackage)
+	}
 	if len(c.Extensions) > 0 {
 		fmt.Fprintf(file, "extensions: %s\n", strings.Join(c.Extensions, ","))
 	}
@@ -583,6 +622,9 @@ func (c *Config) LogInfo(log *logger.Logger) {
 			"build_mode":   c.BuildMode,
 			"ssh_user":     c.SSHUser,
 			"pg_soft_dir":  c.PGSoftDir,
+			"patroni_pkg":  c.PatroniPackage != "",
+			"patroni_whl":  c.PatroniWheelhouse != "",
+			"etcd_pkg":     c.EtcdPackage != "",
 			"extensions":   c.Extensions,
 			"group_count":  len(c.Groups),
 			"total_nodes":  len(c.GetAllNodes()),
@@ -648,6 +690,82 @@ func (c *Config) HasPassword() bool {
 	return c.SSHPassword != ""
 }
 
+func (c *Config) resolveArtifactPaths() {
+	if c.configPath == "" {
+		return
+	}
+
+	baseDir := filepath.Dir(c.configPath)
+	c.PGSource = resolveConfigRelativePath(baseDir, c.PGSource)
+	c.PatroniPackage = resolveConfigRelativePath(baseDir, c.PatroniPackage)
+	c.PatroniWheelhouse = resolveConfigRelativePath(baseDir, c.PatroniWheelhouse)
+	c.EtcdPackage = resolveConfigRelativePath(baseDir, c.EtcdPackage)
+
+	if c.DeployMode == ModePatroni {
+		if c.PatroniPackage == "" {
+			c.PatroniPackage = firstExistingPath(baseDir,
+				"soft/patroni-runtime",
+				"soft/patroni-runtime-linux-amd64.tar.gz",
+				"soft/patroni-runtime.tar.gz",
+			)
+			if c.PatroniPackage == "" && hasPatroniRuntimeFiles(filepath.Join(baseDir, "soft")) {
+				c.PatroniPackage = filepath.Join(baseDir, "soft")
+			}
+		}
+		if c.PatroniWheelhouse == "" {
+			c.PatroniWheelhouse = firstExistingPath(baseDir,
+				"soft/patroni-wheelhouse-debian-amd64.tar.gz",
+				"soft/patroni-wheelhouse.tar.gz",
+			)
+		}
+		if c.EtcdPackage == "" {
+			c.EtcdPackage = firstExistingPath(baseDir,
+				"soft/etcd-runtime",
+				"soft/etcd-linux-amd64.tar.gz",
+				"soft/etcd-runtime.tar.gz",
+			)
+			if c.EtcdPackage == "" && hasEtcdRuntimeFiles(filepath.Join(baseDir, "soft")) {
+				c.EtcdPackage = filepath.Join(baseDir, "soft")
+			}
+		}
+	}
+}
+
+func firstExistingPath(baseDir string, candidates ...string) string {
+	for _, candidate := range candidates {
+		resolved := resolveConfigRelativePath(baseDir, candidate)
+		if resolved == "" {
+			continue
+		}
+		if _, err := os.Stat(resolved); err == nil {
+			return resolved
+		}
+	}
+	return ""
+}
+
+func hasPatroniRuntimeFiles(dir string) bool {
+	required := []string{"python3", "patroni", "patronictl"}
+	for _, name := range required {
+		info, err := os.Stat(filepath.Join(dir, name))
+		if err != nil || info.IsDir() {
+			return false
+		}
+	}
+	return true
+}
+
+func hasEtcdRuntimeFiles(dir string) bool {
+	required := []string{"etcd", "etcdctl"}
+	for _, name := range required {
+		info, err := os.Stat(filepath.Join(dir, name))
+		if err != nil || info.IsDir() {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *Config) ApplyEnvironment() {
 	if c.EnvironmentName == "" {
 		return
@@ -710,4 +828,11 @@ func (c *Config) scopeName(name string) string {
 	}
 
 	return prefix + name
+}
+
+func resolveConfigRelativePath(baseDir, pathValue string) string {
+	if pathValue == "" || filepath.IsAbs(pathValue) {
+		return pathValue
+	}
+	return filepath.Clean(filepath.Join(baseDir, pathValue))
 }

@@ -16,7 +16,15 @@ import (
 func NewCommand(log *logger.Logger) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "env",
-		Short: "管理多环境",
+		Short: "查看或清理当前配置对应的环境",
+		Long: `env 子命令面向已经存在的目标环境。
+
+常见用途：
+  - 查看当前配置对应节点、服务和路径摘要
+  - 预演销毁计划
+  - 在重建前单独清理旧环境
+
+Patroni 模式下，env destroy 会优先处理 Patroni 服务、etcd 服务、DCS 键以及探测到的真实路径。`,
 	}
 
 	cmd.AddCommand(newListCommand(log))
@@ -29,6 +37,9 @@ func newListCommand(log *logger.Logger) *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
 		Short: "列出当前配置对应的环境信息",
+		Long: `根据当前配置文件，汇总环境名称、节点、服务和关键路径。
+
+这条命令不会修改远端环境，适合在 destroy 或 deploy 前确认当前配置到底会作用到哪些主机和实例。`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			configFile, _ := cmd.Flags().GetString("config")
 			if configFile == "" {
@@ -63,6 +74,16 @@ func newDestroyCommand(log *logger.Logger) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "destroy",
 		Short: "清理当前配置对应的环境",
+		Long: `按当前配置生成销毁计划，并删除该环境对应的服务、配置、数据和运行时目录。
+
+默认会删除：
+  - PostgreSQL 数据目录、WAL 目录、日志目录
+  - PostgreSQL / Patroni / etcd 安装目录
+  - Patroni systemd 服务与 YAML
+  - etcd systemd 服务、配置和数据目录
+  - Patroni DCS 键
+
+Patroni 模式下，命令会在远端探测真实路径，再执行删除，避免只按固定默认路径清理。`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			configFile, _ := cmd.Flags().GetString("config")
 			dryRun, _ := cmd.Flags().GetBool("dry-run")
@@ -79,7 +100,7 @@ func newDestroyCommand(log *logger.Logger) *cobra.Command {
 			}
 
 			if !force && !dryRun {
-				return fmt.Errorf("destroy-env 是破坏性操作，请显式传入 --yes")
+				return fmt.Errorf("env destroy 是破坏性操作，请显式传入 --yes")
 			}
 
 			exec, err := common.BuildExecutor(cfg, log)
@@ -87,44 +108,48 @@ func newDestroyCommand(log *logger.Logger) *cobra.Command {
 				return err
 			}
 
-			plan := buildDestroyPlan(cfg, destroyOptions{
+			plan := BuildDestroyPlan(cfg, DestroyOptions{
 				KeepBinaries: keepBinaries,
 				KeepData:     keepData,
 				KeepLogs:     keepLogs,
 			})
-			printDestroyPlan(cfg, plan, dryRun)
+			PrintDestroyPlan(cfg, plan, dryRun)
 			if dryRun {
 				return nil
 			}
 
-			return executeDestroyPlan(cfg, exec, log, plan)
+			return ExecuteDestroyPlan(cfg, exec, log, plan)
 		},
 	}
 
-	cmd.Flags().BoolVar(&force, "yes", false, "确认执行清理")
-	cmd.Flags().BoolVar(&keepBinaries, "keep-binaries", false, "保留 PostgreSQL 安装目录")
-	cmd.Flags().BoolVar(&keepData, "keep-data", false, "保留数据目录和 WAL 目录")
-	cmd.Flags().BoolVar(&keepLogs, "keep-logs", false, "保留日志目录")
+	cmd.Flags().BoolVar(&force, "yes", false, "确认执行破坏性清理")
+	cmd.Flags().BoolVar(&keepBinaries, "keep-binaries", false, "保留 PostgreSQL / Patroni / etcd 安装目录")
+	cmd.Flags().BoolVar(&keepData, "keep-data", false, "保留 PostgreSQL 数据目录和 WAL 目录")
+	cmd.Flags().BoolVar(&keepLogs, "keep-logs", false, "保留 PostgreSQL / Patroni / etcd 日志目录")
 	return cmd
 }
 
-type destroyPlan struct {
+type DestroyPlan struct {
 	Hosts           map[string][]string
 	PatroniServices map[string][]string
 	PatroniFiles    map[string][]string
+	EtcdServices    map[string][]string
+	EtcdFiles       map[string][]string
 }
 
-type destroyOptions struct {
+type DestroyOptions struct {
 	KeepBinaries bool
 	KeepData     bool
 	KeepLogs     bool
 }
 
-func buildDestroyPlan(cfg *config.Config, opts destroyOptions) *destroyPlan {
-	plan := &destroyPlan{
+func BuildDestroyPlan(cfg *config.Config, opts DestroyOptions) *DestroyPlan {
+	plan := &DestroyPlan{
 		Hosts:           make(map[string][]string),
 		PatroniServices: make(map[string][]string),
 		PatroniFiles:    make(map[string][]string),
+		EtcdServices:    make(map[string][]string),
+		EtcdFiles:       make(map[string][]string),
 	}
 
 	addPath := func(host, path string) {
@@ -148,6 +173,20 @@ func buildDestroyPlan(cfg *config.Config, opts destroyOptions) *destroyPlan {
 		plan.PatroniFiles[host] = appendUnique(plan.PatroniFiles[host], file)
 	}
 
+	addEtcdService := func(host, service string) {
+		if service == "" {
+			return
+		}
+		plan.EtcdServices[host] = appendUnique(plan.EtcdServices[host], service)
+	}
+
+	addEtcdFile := func(host, file string) {
+		if file == "" {
+			return
+		}
+		plan.EtcdFiles[host] = appendUnique(plan.EtcdFiles[host], file)
+	}
+
 	for _, node := range cfg.GetAllNodes() {
 		if !opts.KeepData {
 			addPath(node.Host, node.DataDir)
@@ -166,14 +205,88 @@ func buildDestroyPlan(cfg *config.Config, opts destroyOptions) *destroyPlan {
 	if !opts.KeepBinaries {
 		for _, host := range uniqueHosts(cfg) {
 			addPath(host, cfg.PGSoftDir)
+			if cfg.DeployMode == config.ModePatroni {
+				addPath(host, "/opt/pg-deploy/patroni-runtime")
+				addPath(host, "/opt/pg-deploy/patroni-wheelhouse")
+				addPath(host, "/opt/pg-deploy/etcd-runtime")
+				addEtcdFile(host, "/usr/local/bin/etcd")
+				addEtcdFile(host, "/usr/local/bin/etcdctl")
+				addFile(host, "/usr/local/bin/patroni")
+				addFile(host, "/usr/local/bin/patronictl")
+			}
+		}
+	}
+
+	if cfg.DeployMode == config.ModePatroni {
+		for _, host := range uniqueHosts(cfg) {
+			addEtcdService(host, "etcd")
+			addEtcdFile(host, "/etc/systemd/system/etcd.service")
+			addEtcdFile(host, "/etc/etcd/etcd.yml")
+			if !opts.KeepData {
+				addPath(host, "/var/lib/etcd")
+			}
 		}
 	}
 
 	return plan
 }
 
-func executeDestroyPlan(cfg *config.Config, exec *executor.Executor, log *logger.Logger, plan *destroyPlan) error {
+func ExecuteDestroyPlan(cfg *config.Config, exec *executor.Executor, log *logger.Logger, plan *DestroyPlan) error {
+	if err := enrichDestroyPlanWithRemoteDiscovery(cfg, exec, log, plan); err != nil {
+		log.Warn("Failed to enrich destroy plan from remote state", logger.Fields{"error": err})
+	}
+
+	if cfg.DeployMode == config.ModePatroni {
+		if err := pausePatroniCluster(cfg, exec, log); err != nil {
+			log.Warn("Failed to pause Patroni cluster before destroy", logger.Fields{"error": err})
+		}
+		if err := clearPatroniDCS(cfg, exec, log); err != nil {
+			log.Warn("Failed to clear Patroni DCS state before destroy", logger.Fields{"error": err})
+		}
+	}
+
 	hosts := sortedKeys(plan.Hosts)
+	for _, host := range hosts {
+		node := destroyPlanExecutorNode(cfg, host)
+
+		if cfg.DeployMode == config.ModePatroni && len(plan.PatroniServices[host]) > 0 {
+			cmd := systemctlStopDisableCommand(plan.PatroniServices[host])
+			if result := exec.RunOnNode(node, cmd, true, false); result.Error != nil {
+				log.Warn("Failed to stop Patroni services", logger.Fields{"host": host, "services": plan.PatroniServices[host], "error": result.Error})
+			}
+		}
+	}
+
+	for _, host := range hosts {
+		node := destroyPlanExecutorNode(cfg, host)
+
+		if cfg.DeployMode == config.ModePatroni && len(plan.EtcdServices[host]) > 0 {
+			cmd := systemctlStopDisableCommand(plan.EtcdServices[host])
+			if result := exec.RunOnNode(node, cmd, true, false); result.Error != nil {
+				log.Warn("Failed to stop etcd services", logger.Fields{"host": host, "services": plan.EtcdServices[host], "error": result.Error})
+			}
+		}
+	}
+
+	for _, host := range hosts {
+		node := destroyPlanExecutorNode(cfg, host)
+
+		if cfg.DeployMode == config.ModePatroni {
+			if len(plan.PatroniFiles[host]) > 0 {
+				cmd := fmt.Sprintf("rm -f %s && systemctl daemon-reload || true", shellJoin(plan.PatroniFiles[host]))
+				if result := exec.RunOnNode(node, cmd, true, false); result.Error != nil {
+					log.Warn("Failed to remove Patroni files", logger.Fields{"host": host, "error": result.Error})
+				}
+			}
+			if len(plan.EtcdFiles[host]) > 0 {
+				cmd := fmt.Sprintf("rm -f %s && systemctl daemon-reload || true", shellJoin(plan.EtcdFiles[host]))
+				if result := exec.RunOnNode(node, cmd, true, false); result.Error != nil {
+					log.Warn("Failed to remove etcd files", logger.Fields{"host": host, "error": result.Error})
+				}
+			}
+		}
+	}
+
 	for _, host := range hosts {
 		node := &executor.Node{
 			ID:       host,
@@ -181,21 +294,6 @@ func executeDestroyPlan(cfg *config.Config, exec *executor.Executor, log *logger
 			Port:     22,
 			User:     cfg.SSHUser,
 			Password: cfg.SSHPassword,
-		}
-
-		if cfg.DeployMode == config.ModePatroni {
-			for _, service := range plan.PatroniServices[host] {
-				cmd := fmt.Sprintf("systemctl stop %s 2>/dev/null || true && systemctl disable %s 2>/dev/null || true", service, service)
-				if result := exec.RunOnNode(node, cmd, true, false); result.Error != nil {
-					log.Warn("Failed to stop Patroni service", logger.Fields{"host": host, "service": service, "error": result.Error})
-				}
-			}
-			if len(plan.PatroniFiles[host]) > 0 {
-				cmd := fmt.Sprintf("rm -f %s && systemctl daemon-reload || true", shellJoin(plan.PatroniFiles[host]))
-				if result := exec.RunOnNode(node, cmd, true, false); result.Error != nil {
-					log.Warn("Failed to remove Patroni files", logger.Fields{"host": host, "error": result.Error})
-				}
-			}
 		}
 
 		for _, path := range plan.Hosts[host] {
@@ -207,6 +305,238 @@ func executeDestroyPlan(cfg *config.Config, exec *executor.Executor, log *logger
 	}
 
 	return nil
+}
+
+func enrichDestroyPlanWithRemoteDiscovery(cfg *config.Config, exec *executor.Executor, log *logger.Logger, plan *DestroyPlan) error {
+	for _, host := range uniqueHosts(cfg) {
+		node := destroyPlanExecutorNode(cfg, host)
+		output, err := discoverDestroyArtifacts(node, exec, plan)
+		if err != nil {
+			return fmt.Errorf("host %s: %w", host, err)
+		}
+		applyDiscoveredArtifacts(plan, host, output)
+	}
+
+	log.Info("Destroy plan enriched from remote state",
+		logger.Fields{"hosts": len(uniqueHosts(cfg))})
+	return nil
+}
+
+func discoverDestroyArtifacts(node *executor.Node, exec *executor.Executor, plan *DestroyPlan) (string, error) {
+	cmd := buildArtifactDiscoveryCommand(plan.PatroniServices[node.Host], plan.EtcdServices[node.Host], plan.PatroniFiles[node.Host], plan.EtcdFiles[node.Host])
+	result := exec.RunOnNode(node, cmd, true, true)
+	if result.Error != nil {
+		return "", result.Error
+	}
+	return result.Output, nil
+}
+
+func buildArtifactDiscoveryCommand(patroniServices, etcdServices, patroniFiles, etcdFiles []string) string {
+	patroniSvcList := shellListOrBlankToken(patroniServices)
+	etcdSvcList := shellListOrBlankToken(etcdServices)
+	patroniFileList := shellListOrBlankToken(patroniFiles)
+	etcdFileList := shellListOrBlankToken(etcdFiles)
+
+	return fmt.Sprintf(`
+emit_file() { [ -n "$1" ] && printf 'FILE\t%%s\n' "$1"; }
+emit_path() { [ -n "$1" ] && printf 'PATH\t%%s\n' "$1"; }
+trim_quotes() { printf '%%s' "$1" | tr -d "\"'"; }
+
+discover_patroni_cfg() {
+  cfg="$1"
+  [ -n "$cfg" ] || return 0
+  [ -f "$cfg" ] || return 0
+  emit_file "$cfg"
+  data_dir=$(sed -n 's/^[[:space:]]*data_dir:[[:space:]]*//p' "$cfg" | head -n 1)
+  data_dir=$(trim_quotes "$data_dir")
+  emit_path "$data_dir"
+  bin_dir=$(sed -n 's/^[[:space:]]*bin_dir:[[:space:]]*//p' "$cfg" | head -n 1)
+  bin_dir=$(trim_quotes "$bin_dir")
+  case "$bin_dir" in
+    */bin) emit_path "${bin_dir%%/bin}" ;;
+  esac
+}
+
+discover_etcd_cfg() {
+  cfg="$1"
+  [ -n "$cfg" ] || return 0
+  [ -f "$cfg" ] || return 0
+  emit_file "$cfg"
+  data_dir=$(sed -n 's/^[[:space:]]*data-dir:[[:space:]]*//p' "$cfg" | head -n 1)
+  data_dir=$(trim_quotes "$data_dir")
+  emit_path "$data_dir"
+}
+
+for svc in %s; do
+  fragment=$(systemctl show -p FragmentPath --value "$svc" 2>/dev/null || true)
+  emit_file "$fragment"
+  cfg=$(systemctl cat "$svc" 2>/dev/null | sed -n "s@.*patroni \([^'\"[:space:]]*\.yml\).*@\1@p" | head -n 1)
+  [ -n "$cfg" ] && printf 'PATRONI_CFG\t%%s\n' "$cfg"
+done
+
+for svc in %s; do
+  fragment=$(systemctl show -p FragmentPath --value "$svc" 2>/dev/null || true)
+  emit_file "$fragment"
+  cfg=$(systemctl cat "$svc" 2>/dev/null | sed -n "s@.*--config-file=\([^'\"[:space:]]*\).*@\1@p" | head -n 1)
+  [ -n "$cfg" ] && printf 'ETCD_CFG\t%%s\n' "$cfg"
+done
+
+for cfg in %s; do
+  [ -f "$cfg" ] && printf 'PATRONI_CFG\t%%s\n' "$cfg"
+done
+
+for cfg in %s; do
+  [ -f "$cfg" ] && printf 'ETCD_CFG\t%%s\n' "$cfg"
+done
+
+for cfg in /etc/patroni/*.yml; do
+  [ -f "$cfg" ] && printf 'PATRONI_CFG\t%%s\n' "$cfg"
+done
+
+for bin in /usr/local/bin/patroni /usr/local/bin/patronictl /usr/local/bin/etcd /usr/local/bin/etcdctl; do
+  target=$(readlink -f "$bin" 2>/dev/null || true)
+  [ -n "$target" ] || continue
+  emit_file "$bin"
+  case "$target" in
+    */bin/*) emit_path "$(dirname "$(dirname "$target")")" ;;
+  esac
+done
+`, patroniSvcList, etcdSvcList, patroniFileList, etcdFileList)
+}
+
+func applyDiscoveredArtifacts(plan *DestroyPlan, host, output string) {
+	patroniCfgs := make([]string, 0)
+	etcdCfgs := make([]string, 0)
+
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		kind := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		if value == "" {
+			continue
+		}
+
+		switch kind {
+		case "FILE":
+			plan.PatroniFiles[host] = appendUnique(plan.PatroniFiles[host], value)
+			plan.EtcdFiles[host] = appendUnique(plan.EtcdFiles[host], value)
+		case "PATH":
+			plan.Hosts[host] = appendUnique(plan.Hosts[host], value)
+		case "PATRONI_CFG":
+			patroniCfgs = appendUnique(patroniCfgs, value)
+			plan.PatroniFiles[host] = appendUnique(plan.PatroniFiles[host], value)
+		case "ETCD_CFG":
+			etcdCfgs = appendUnique(etcdCfgs, value)
+			plan.EtcdFiles[host] = appendUnique(plan.EtcdFiles[host], value)
+		}
+	}
+
+	for _, cfg := range patroniCfgs {
+		plan.PatroniFiles[host] = appendUnique(plan.PatroniFiles[host], cfg)
+	}
+	for _, cfg := range etcdCfgs {
+		plan.EtcdFiles[host] = appendUnique(plan.EtcdFiles[host], cfg)
+	}
+
+	filteredPatroniFiles := make([]string, 0, len(plan.PatroniFiles[host]))
+	filteredEtcdFiles := make([]string, 0, len(plan.EtcdFiles[host]))
+	for _, file := range plan.PatroniFiles[host] {
+		if strings.HasSuffix(file, ".yml") || strings.Contains(file, "patroni-") || strings.Contains(file, "/usr/local/bin/patroni") {
+			filteredPatroniFiles = appendUnique(filteredPatroniFiles, file)
+		}
+	}
+	for _, file := range plan.EtcdFiles[host] {
+		if strings.Contains(file, "etcd") {
+			filteredEtcdFiles = appendUnique(filteredEtcdFiles, file)
+		}
+	}
+	if len(filteredPatroniFiles) > 0 {
+		plan.PatroniFiles[host] = filteredPatroniFiles
+	}
+	if len(filteredEtcdFiles) > 0 {
+		plan.EtcdFiles[host] = filteredEtcdFiles
+	}
+}
+
+func destroyPlanExecutorNode(cfg *config.Config, host string) *executor.Node {
+	return &executor.Node{
+		ID:       host,
+		Host:     host,
+		Port:     22,
+		User:     cfg.SSHUser,
+		Password: cfg.SSHPassword,
+	}
+}
+
+func pausePatroniCluster(cfg *config.Config, exec *executor.Executor, log *logger.Logger) error {
+	nodes := cfg.GetAllNodes()
+	if len(nodes) == 0 {
+		return nil
+	}
+
+	controlNode := nodes[0]
+	cmd := patroniPauseCommand(controlNode.Name)
+	result := exec.RunOnNode(&executor.Node{
+		ID:       controlNode.Host,
+		Host:     controlNode.Host,
+		Port:     22,
+		User:     cfg.SSHUser,
+		Password: cfg.SSHPassword,
+	}, cmd, true, true)
+	if result.Error != nil {
+		return result.Error
+	}
+
+	log.Info("Patroni cluster paused before destroy",
+		logger.Fields{"control_node": controlNode.Name, "host": controlNode.Host})
+	return nil
+}
+
+func clearPatroniDCS(cfg *config.Config, exec *executor.Executor, log *logger.Logger) error {
+	nodes := cfg.GetAllNodes()
+	if len(nodes) == 0 {
+		return nil
+	}
+
+	controlNode := nodes[0]
+	cmd := patroniDCSCleanupCommand()
+	result := exec.RunOnNode(&executor.Node{
+		ID:       controlNode.Host,
+		Host:     controlNode.Host,
+		Port:     22,
+		User:     cfg.SSHUser,
+		Password: cfg.SSHPassword,
+	}, cmd, true, true)
+	if result.Error != nil {
+		return result.Error
+	}
+
+	log.Info("Patroni DCS state cleared before destroy",
+		logger.Fields{"control_node": controlNode.Name, "host": controlNode.Host})
+	return nil
+}
+
+func patroniPauseCommand(nodeName string) string {
+	configFile := shellQuote(fmt.Sprintf("/etc/patroni/%s.yml", nodeName))
+	return fmt.Sprintf("if command -v patronictl >/dev/null 2>&1; then patronictl -c %s pause --wait || patronictl -c %s pause || true; fi", configFile, configFile)
+}
+
+func patroniDCSCleanupCommand() string {
+	return "if command -v etcdctl >/dev/null 2>&1; then ETCDCTL_API=3 etcdctl del /service/pg-cluster --prefix || true; fi"
+}
+
+func systemctlStopDisableCommand(services []string) string {
+	sortedServices := append([]string(nil), services...)
+	sort.Strings(sortedServices)
+	joined := strings.Join(sortedServices, " ")
+	return fmt.Sprintf("systemctl stop %s 2>/dev/null || true && systemctl disable %s 2>/dev/null || true", joined, joined)
 }
 
 type environmentStatus struct {
@@ -269,7 +599,7 @@ func printEnvironmentSummary(cfg *config.Config, status *environmentStatus) {
 	}
 }
 
-func printDestroyPlan(cfg *config.Config, plan *destroyPlan, dryRun bool) {
+func PrintDestroyPlan(cfg *config.Config, plan *DestroyPlan, dryRun bool) {
 	action := "Destroy plan"
 	if dryRun {
 		action = "Destroy dry-run"
@@ -281,8 +611,14 @@ func printDestroyPlan(cfg *config.Config, plan *destroyPlan, dryRun bool) {
 		if len(plan.PatroniServices[host]) > 0 {
 			fmt.Printf("  Patroni services: %s\n", strings.Join(plan.PatroniServices[host], ", "))
 		}
+		if len(plan.EtcdServices[host]) > 0 {
+			fmt.Printf("  Etcd services: %s\n", strings.Join(plan.EtcdServices[host], ", "))
+		}
 		if len(plan.PatroniFiles[host]) > 0 {
 			fmt.Printf("  Patroni files: %s\n", strings.Join(plan.PatroniFiles[host], ", "))
+		}
+		if len(plan.EtcdFiles[host]) > 0 {
+			fmt.Printf("  Etcd files: %s\n", strings.Join(plan.EtcdFiles[host], ", "))
 		}
 		fmt.Printf("  Paths: %s\n", strings.Join(plan.Hosts[host], ", "))
 	}
@@ -326,6 +662,13 @@ func shellJoin(values []string) string {
 		quoted = append(quoted, shellQuote(value))
 	}
 	return strings.Join(quoted, " ")
+}
+
+func shellListOrBlankToken(values []string) string {
+	if len(values) == 0 {
+		return "''"
+	}
+	return shellJoin(values)
 }
 
 func uniqueHosts(cfg *config.Config) []string {

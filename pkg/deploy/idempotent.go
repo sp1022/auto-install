@@ -193,7 +193,7 @@ func (c *IdempotentChecker) CheckPatroniInstalled() (bool, error) {
 		return true, nil
 	}
 
-	cmd := "python3 -c 'import patroni; print(patroni.__version__)' 2>/dev/null"
+	cmd := "command -v patroni >/dev/null 2>&1 && command -v patronictl >/dev/null 2>&1"
 
 	nodes := c.config.GetAllNodes()
 	for _, node := range nodes {
@@ -203,7 +203,7 @@ func (c *IdempotentChecker) CheckPatroniInstalled() (bool, error) {
 			User: c.config.SSHUser,
 		}, cmd, false, false)
 
-		if result.Error != nil || !strings.Contains(result.Output, ".") {
+		if result.Error != nil {
 			return false, nil
 		}
 	}

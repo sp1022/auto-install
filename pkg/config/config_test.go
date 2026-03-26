@@ -100,6 +100,196 @@ group_0: 0|pg0|coordinator|192.168.1.10:5432:/data/pgdata::::1,1|pg1|coordinator
 	}
 }
 
+func TestLoad_ResolvesOfflinePackagePathsRelativeToConfig(t *testing.T) {
+	tmpDir := t.TempDir()
+	softDir := filepath.Join(tmpDir, "soft")
+	if err := os.MkdirAll(softDir, 0755); err != nil {
+		t.Fatalf("failed to create soft dir: %v", err)
+	}
+
+	fakeSource := filepath.Join(softDir, "postgresql.tar.gz")
+	fakePatroni := filepath.Join(softDir, "patroni-runtime.tar.gz")
+	fakeWheelhouse := filepath.Join(softDir, "patroni-wheelhouse.tar.gz")
+	fakeEtcd := filepath.Join(softDir, "etcd-runtime.tar.gz")
+	for _, path := range []string{fakeSource, fakePatroni, fakeWheelhouse, fakeEtcd} {
+		if err := os.WriteFile(path, []byte("fake content"), 0644); err != nil {
+			t.Fatalf("failed to create fake artifact %s: %v", path, err)
+		}
+	}
+
+	configPath := filepath.Join(tmpDir, "deploy.conf")
+	configContent := `
+ssh_user: root
+deploy_mode: patroni
+build_mode: compile
+pg_source: soft/postgresql.tar.gz
+pg_soft_dir: /usr/local/pgsql
+patroni_package: soft/patroni-runtime.tar.gz
+patroni_wheelhouse: soft/patroni-wheelhouse.tar.gz
+etcd_package: soft/etcd-runtime.tar.gz
+group_0: 0|pg0|coordinator|127.0.0.1:5432:/data/pgdata::::1
+`
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	if cfg.PGSource != fakeSource {
+		t.Fatalf("expected resolved pg_source %s, got %s", fakeSource, cfg.PGSource)
+	}
+	if cfg.PatroniPackage != fakePatroni {
+		t.Fatalf("expected resolved patroni_package %s, got %s", fakePatroni, cfg.PatroniPackage)
+	}
+	if cfg.PatroniWheelhouse != fakeWheelhouse {
+		t.Fatalf("expected resolved patroni_wheelhouse %s, got %s", fakeWheelhouse, cfg.PatroniWheelhouse)
+	}
+	if cfg.EtcdPackage != fakeEtcd {
+		t.Fatalf("expected resolved etcd_package %s, got %s", fakeEtcd, cfg.EtcdPackage)
+	}
+}
+
+func TestLoad_AutoDetectsPatroniRuntimeDirectoriesInSoft(t *testing.T) {
+	tmpDir := t.TempDir()
+	softDir := filepath.Join(tmpDir, "soft")
+	patroniDir := filepath.Join(softDir, "patroni-runtime", "bin")
+	etcdDir := filepath.Join(softDir, "etcd-runtime", "bin")
+
+	for _, dir := range []string{patroniDir, etcdDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("failed to create runtime dir %s: %v", dir, err)
+		}
+	}
+
+	for _, path := range []string{
+		filepath.Join(patroniDir, "python3"),
+		filepath.Join(patroniDir, "patroni"),
+		filepath.Join(patroniDir, "patronictl"),
+		filepath.Join(etcdDir, "etcd"),
+		filepath.Join(etcdDir, "etcdctl"),
+	} {
+		if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0755); err != nil {
+			t.Fatalf("failed to create runtime executable %s: %v", path, err)
+		}
+	}
+
+	configPath := filepath.Join(tmpDir, "deploy.conf")
+	configContent := `
+ssh_user: root
+deploy_mode: patroni
+build_mode: distribute
+pg_source: /tmp/postgresql.tar.gz
+pg_soft_dir: /usr/local/pgsql
+group_0: 0|pg0|coordinator|127.0.0.1:5432:/data/pgdata::::1
+`
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	expectedPatroni := filepath.Join(softDir, "patroni-runtime")
+	expectedEtcd := filepath.Join(softDir, "etcd-runtime")
+	if cfg.PatroniPackage != expectedPatroni {
+		t.Fatalf("expected auto-detected patroni runtime %s, got %s", expectedPatroni, cfg.PatroniPackage)
+	}
+	if cfg.EtcdPackage != expectedEtcd {
+		t.Fatalf("expected auto-detected etcd runtime %s, got %s", expectedEtcd, cfg.EtcdPackage)
+	}
+}
+
+func TestLoad_AutoDetectsFlatRuntimeFilesInSoft(t *testing.T) {
+	tmpDir := t.TempDir()
+	softDir := filepath.Join(tmpDir, "soft")
+	if err := os.MkdirAll(softDir, 0755); err != nil {
+		t.Fatalf("failed to create soft dir: %v", err)
+	}
+
+	for _, path := range []string{
+		filepath.Join(softDir, "python3"),
+		filepath.Join(softDir, "patroni"),
+		filepath.Join(softDir, "patronictl"),
+		filepath.Join(softDir, "etcd"),
+		filepath.Join(softDir, "etcdctl"),
+	} {
+		if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0755); err != nil {
+			t.Fatalf("failed to create runtime executable %s: %v", path, err)
+		}
+	}
+
+	configPath := filepath.Join(tmpDir, "deploy.conf")
+	configContent := `
+ssh_user: root
+deploy_mode: patroni
+build_mode: distribute
+pg_source: /tmp/postgresql.tar.gz
+pg_soft_dir: /usr/local/pgsql
+group_0: 0|pg0|coordinator|127.0.0.1:5432:/data/pgdata::::1
+`
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	if cfg.PatroniPackage != softDir {
+		t.Fatalf("expected auto-detected flat patroni runtime %s, got %s", softDir, cfg.PatroniPackage)
+	}
+	if cfg.EtcdPackage != softDir {
+		t.Fatalf("expected auto-detected flat etcd runtime %s, got %s", softDir, cfg.EtcdPackage)
+	}
+}
+
+func TestLoad_AutoDetectsPatroniWheelhouseInSoft(t *testing.T) {
+	tmpDir := t.TempDir()
+	softDir := filepath.Join(tmpDir, "soft")
+	if err := os.MkdirAll(softDir, 0755); err != nil {
+		t.Fatalf("failed to create soft dir: %v", err)
+	}
+
+	wheelhouse := filepath.Join(softDir, "patroni-wheelhouse-debian-amd64.tar.gz")
+	etcdPkg := filepath.Join(softDir, "etcd-linux-amd64.tar.gz")
+	for _, path := range []string{wheelhouse, etcdPkg} {
+		if err := os.WriteFile(path, []byte("fake content"), 0644); err != nil {
+			t.Fatalf("failed to create artifact %s: %v", path, err)
+		}
+	}
+
+	configPath := filepath.Join(tmpDir, "deploy.conf")
+	configContent := `
+ssh_user: root
+deploy_mode: patroni
+build_mode: distribute
+pg_source: /tmp/postgresql.tar.gz
+pg_soft_dir: /usr/local/pgsql
+group_0: 0|pg0|coordinator|127.0.0.1:5432:/data/pgdata::::1
+`
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	if cfg.PatroniWheelhouse != wheelhouse {
+		t.Fatalf("expected auto-detected patroni wheelhouse %s, got %s", wheelhouse, cfg.PatroniWheelhouse)
+	}
+	if cfg.EtcdPackage != etcdPkg {
+		t.Fatalf("expected auto-detected etcd package %s, got %s", etcdPkg, cfg.EtcdPackage)
+	}
+}
+
 func TestValidate_MissingRequiredFields(t *testing.T) {
 	cfg := &Config{}
 

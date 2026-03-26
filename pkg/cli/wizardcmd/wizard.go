@@ -20,16 +20,27 @@ func NewCommand(log *logger.Logger) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "wizard",
 		Short: "交互式配置向导",
-		Long: `通过交互式向导收集部署配置：
-  - 部署模式选择
-  - SSH 配置
-  - 节点配置
-  - 保存配置文件`,
+		Long: `wizard 会通过交互问答生成一份可直接使用的部署配置文件。
+
+向导会依次收集：
+  - SSH 用户和密码
+  - 环境名与环境前缀
+  - 部署模式与构建模式
+  - 节点、端口、数据目录和拓扑关系
+
+适用场景：
+  - 首次接触该项目，需要快速生成配置骨架
+  - 想避免手写 group_0 / group_1 这种拓扑字段
+  - 准备先生成配置，再手工补充细节参数`,
 		Example: `  # 启动向导
   pg-deploy wizard
 
   # 保存到指定文件
-  pg-deploy wizard -o my-config.conf`,
+  pg-deploy wizard -o my-config.conf
+
+  # 生成后先验证再部署
+  pg-deploy validate -c my-config.conf
+  pg-deploy deploy -c my-config.conf`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			outputFile, _ = cmd.Flags().GetString("output")
 

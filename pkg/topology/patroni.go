@@ -2,6 +2,7 @@
 package topology
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -50,6 +51,12 @@ func (m *PatroniManager) DeployEtcdCluster() error {
 
 	if err := m.installEtcdCluster(etcdNodes); err != nil {
 		return fmt.Errorf("failed to install etcd cluster dependencies: %w", err)
+	}
+
+	if len(etcdNodes) == 1 {
+		if err := m.resetSingleNodeEtcd(etcdNodes[0]); err != nil {
+			return fmt.Errorf("failed to reset single-node etcd environment: %w", err)
+		}
 	}
 
 	// 生成etcd集群配置
@@ -139,7 +146,8 @@ func (m *PatroniManager) configureEtcdCluster(nodes []*config.NodeConfig) error 
 		configFile := "/etc/etcd/etcd.yml"
 		cmd := fmt.Sprintf("getent group etcd >/dev/null 2>&1 || groupadd --system etcd; "+
 			"id etcd >/dev/null 2>&1 || useradd --system -g etcd -d /var/lib/etcd -s /sbin/nologin etcd; "+
-			"mkdir -p /etc/etcd /var/lib/etcd && chown -R etcd:etcd /etc/etcd /var/lib/etcd && cat > %s << 'EOF'\n%s\nEOF && chown etcd:etcd %s",
+			"mkdir -p /etc/etcd /var/lib/etcd && chown -R etcd:etcd /etc/etcd /var/lib/etcd && "+
+			"cat > %s << 'EOF'\n%s\nEOF\nchown etcd:etcd %s",
 			configFile, etcdConfig, configFile)
 
 		result := m.executor.RunOnNode(&executor.Node{
@@ -179,15 +187,15 @@ func (m *PatroniManager) generateEtcdConfig(node *config.NodeConfig, index, tota
 	thisPeerURL := fmt.Sprintf("http://%s:2380", node.Host)
 	thisClientURL := fmt.Sprintf("http://%s:2379", node.Host)
 
-	config := fmt.Sprintf(`name: %s
-data-dir: /var/lib/etcd
-listen-peer-urls: http://0.0.0.0:2380
-listen-client-urls: http://0.0.0.0:2379,http://127.0.0.1:2379
-initial-advertise-peer-urls: %s
-advertise-client-urls: %s
-initial-cluster: %s
-initial-cluster-state: new
-initial-cluster-token: patroni-etcd-cluster
+	config := fmt.Sprintf(`name: "%s"
+data-dir: "/var/lib/etcd"
+listen-peer-urls: "http://0.0.0.0:2380"
+listen-client-urls: "http://0.0.0.0:2379"
+initial-advertise-peer-urls: "%s"
+advertise-client-urls: "%s"
+initial-cluster: "%s"
+initial-cluster-state: "new"
+initial-cluster-token: "patroni-etcd-cluster"
 `, thisMemberName, thisPeerURL, thisClientURL, strings.Join(initialCluster, ","))
 
 	return config
@@ -222,7 +230,8 @@ func (m *PatroniManager) startEtcdCluster(nodes []*config.NodeConfig) error {
 		}, cmd, true, false)
 
 		if result.Error != nil {
-			return fmt.Errorf("failed to start etcd on %s: %w", node.Host, result.Error)
+			diag := m.collectEtcdDiagnostics(node)
+			return fmt.Errorf("failed to start etcd on %s: %w\n%s", node.Host, result.Error, diag)
 		}
 
 		m.logger.Info("etcd started",
@@ -274,7 +283,7 @@ func (m *PatroniManager) validateEtcdCluster(nodes []*config.NodeConfig) error {
 func (m *PatroniManager) updateEtcdEndpoints(nodes []*config.NodeConfig) {
 	m.etcdEndpoints = make([]string, 0, len(nodes))
 	for _, node := range nodes {
-		endpoint := fmt.Sprintf("http://%s:2379", node.Host)
+		endpoint := fmt.Sprintf("%s:2379", node.Host)
 		m.etcdEndpoints = append(m.etcdEndpoints, endpoint)
 	}
 }
@@ -296,8 +305,8 @@ restapi:
   connect_address: %s:%d
 
 etcd3:
-  hosts:
-%s
+  hosts: "%s"
+  protocol: "http"
 
 bootstrap:
   dcs:
@@ -311,6 +320,7 @@ bootstrap:
         hot_standby: "on"
         max_wal_senders: 10
         max_replication_slots: 10
+        unix_socket_directories: "%s"
   initdb:
     - encoding: UTF8
     - data-checksums
@@ -341,13 +351,15 @@ postgresql:
       username: replicator
       password: "%s"
   parameters:
-    max_connections: 200
-    shared_buffers: 256MB
+    # Conservative defaults so low-memory hosts can start reliably.
+    max_connections: 50
+    shared_buffers: 64MB
     wal_level: replica
     hot_standby: on
     max_wal_senders: 10
     max_replication_slots: 10
     wal_log_hints: on
+    unix_socket_directories: "%s"
 
 tags:
   nofailover: false
@@ -360,7 +372,8 @@ tags:
 		restPort,
 		node.Host,
 		restPort,
-		formatHostList(m.etcdEndpoints),
+		strings.Join(m.etcdEndpoints, ","),
+		node.DataDir,
 		m.replicationPassword,
 		m.superuserPassword,
 		node.Port,
@@ -370,18 +383,10 @@ tags:
 		m.config.PGSoftDir,
 		m.superuserPassword,
 		m.replicationPassword,
+		node.DataDir,
 	)
 
 	return config, nil
-}
-
-// formatHostList 格式化主机列表为YAML数组
-func formatHostList(hosts []string) string {
-	var formatted []string
-	for _, host := range hosts {
-		formatted = append(formatted, fmt.Sprintf("    - %s", host))
-	}
-	return strings.Join(formatted, "\n")
 }
 
 // ConfigurePatroniNode 配置Patroni节点
@@ -424,7 +429,12 @@ func (m *PatroniManager) StartPatroniCluster() error {
 	m.logger.Info("Starting Patroni cluster",
 		logger.Fields{"nodes": len(m.nodes)})
 
-	// 并发启动所有节点
+	for _, node := range m.nodes {
+		if err := m.preparePatroniNodeStart(node); err != nil {
+			return fmt.Errorf("failed to prepare Patroni node %s: %w", node.Host, err)
+		}
+	}
+
 	for _, node := range m.nodes {
 		serviceContent := m.generatePatroniServiceFile(node)
 
@@ -442,7 +452,7 @@ func (m *PatroniManager) StartPatroniCluster() error {
 		}
 	}
 
-	// 启动所有Patroni服务
+	var startFailures []string
 	for _, node := range m.nodes {
 		cmd := fmt.Sprintf("systemctl daemon-reload && systemctl enable patroni-%s && systemctl start patroni-%s",
 			node.Name, node.Name)
@@ -454,11 +464,17 @@ func (m *PatroniManager) StartPatroniCluster() error {
 		}, cmd, true, false)
 
 		if result.Error != nil {
-			return fmt.Errorf("failed to start Patroni on %s: %w", node.Host, result.Error)
+			diag := m.collectPatroniDiagnostics(node)
+			startFailures = append(startFailures, fmt.Sprintf("node=%s error=%v\n%s", node.Host, result.Error, diag))
+			continue
 		}
 
 		m.logger.Info("Patroni started",
 			logger.Fields{"node": node.Host})
+	}
+
+	if len(startFailures) > 0 {
+		return fmt.Errorf("failed to start Patroni on %d node(s):\n%s", len(startFailures), strings.Join(startFailures, "\n\n"))
 	}
 
 	// 验证集群状态
@@ -469,6 +485,79 @@ func (m *PatroniManager) StartPatroniCluster() error {
 	return nil
 }
 
+func (m *PatroniManager) preparePatroniNodeStart(node *config.NodeConfig) error {
+	commands := []string{
+		fmt.Sprintf("mkdir -p %s", shellValue(node.DataDir)),
+		fmt.Sprintf("chown postgres:postgres %s", shellValue(node.DataDir)),
+		fmt.Sprintf("chmod 0700 %s", shellValue(node.DataDir)),
+	}
+
+	if node.WALDir != "" {
+		commands = append(commands,
+			fmt.Sprintf("mkdir -p %s", shellValue(node.WALDir)),
+			fmt.Sprintf("chown postgres:postgres %s", shellValue(node.WALDir)),
+			fmt.Sprintf("chmod 0700 %s", shellValue(node.WALDir)),
+		)
+	}
+
+	if node.PGLogDir != "" {
+		commands = append(commands,
+			fmt.Sprintf("mkdir -p %s", shellValue(node.PGLogDir)),
+			fmt.Sprintf("chown postgres:postgres %s", shellValue(node.PGLogDir)),
+			fmt.Sprintf("chmod 0755 %s", shellValue(node.PGLogDir)),
+		)
+	}
+
+	result := m.executor.RunOnNode(&executor.Node{
+		ID:   node.Host,
+		Host: node.Host,
+		User: m.config.SSHUser,
+	}, strings.Join(commands, " && "), true, false)
+	if result.Error != nil {
+		return result.Error
+	}
+	return nil
+}
+
+func (m *PatroniManager) collectPatroniDiagnostics(node *config.NodeConfig) string {
+	serviceName := fmt.Sprintf("patroni-%s", node.Name)
+	configFile := fmt.Sprintf("/etc/patroni/%s.yml", node.Name)
+	serviceFile := fmt.Sprintf("/etc/systemd/system/%s.service", serviceName)
+	cmd := fmt.Sprintf(`
+echo '=== systemctl status %s ==='
+systemctl status %s --no-pager -l 2>&1 || true
+echo ''
+echo '=== journalctl -u %s ==='
+journalctl -u %s -n 80 --no-pager 2>&1 || true
+echo ''
+echo '=== %s ==='
+cat %s 2>&1 || true
+echo ''
+echo '=== data directory permissions ==='
+namei -l %s 2>&1 || true
+echo ''
+echo '=== %s ==='
+cat %s 2>&1 || true
+echo ''
+echo '=== command -v patroni ==='
+command -v patroni 2>&1 || true
+echo ''
+echo '=== patroni version ==='
+patroni --version 2>&1 || true
+`, serviceName, serviceName, serviceName, serviceName, configFile, configFile, node.DataDir, serviceFile, serviceFile)
+
+	result := m.executor.RunOnNode(&executor.Node{
+		ID:   node.Host,
+		Host: node.Host,
+		User: m.config.SSHUser,
+	}, cmd, true, true)
+	return strings.TrimSpace(result.Output)
+}
+
+func shellValue(v string) string {
+	return "'" + strings.ReplaceAll(v, "'", "'\\''") + "'"
+}
+
 // generatePatroniServiceFile 生成Patroni systemd服务文件
 func (m *PatroniManager) generatePatroniServiceFile(node *config.NodeConfig) string {
 	return fmt.Sprintf(`[Unit]
@@ -476,10 +565,11 @@ Description=Patroni instance for %s
 After=network.target etcd.service
 
 [Service]
-Type=notify
+Type=simple
 User=postgres
 Group=postgres
-ExecStart=/bin/bash -lc 'exec $(command -v patroni) /etc/patroni/%s.yml'
+Environment=PATH=/opt/pg-deploy/patroni-runtime/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/bash -lc 'if [ -x /opt/pg-deploy/patroni-runtime/bin/patroni ]; then exec /opt/pg-deploy/patroni-runtime/bin/patroni /etc/patroni/%s.yml; elif [ -x /usr/local/bin/patroni ]; then exec /usr/local/bin/patroni /etc/patroni/%s.yml; else exec patroni /etc/patroni/%s.yml; fi'
 KillMode=process
 Restart=on-failure
 RestartSec=10s
@@ -487,7 +577,7 @@ TimeoutSec=0
 
 [Install]
 WantedBy=multi-user.target
-`, node.Name, node.Name)
+`, node.Name, node.Name, node.Name, node.Name)
 }
 
 // validatePatroniCluster 验证Patroni集群状态
@@ -505,7 +595,13 @@ func (m *PatroniManager) validatePatroniCluster() error {
 	hasLeader := false
 	// 验证每个成员
 	for _, member := range memberList.Members {
-		if member.Role == "leader" {
+		m.logger.Debug("Patroni member status", logger.Fields{
+			"name":  member.Name,
+			"host":  member.Host,
+			"role":  member.Role,
+			"state": member.State,
+		})
+		if isLeaderRole(member.Role) {
 			hasLeader = true
 			m.logger.Info("Cluster leader",
 				logger.Fields{
@@ -564,7 +660,55 @@ func (m *PatroniManager) waitForEtcdHealthy(node *config.NodeConfig, endpointLis
 		time.Sleep(1 * time.Second)
 	}
 
-	return fmt.Errorf("etcd not healthy on %s after %s: %s", node.Host, timeout, lastOutput)
+	diag := m.collectEtcdDiagnostics(node)
+	return fmt.Errorf("etcd not healthy on %s after %s: %s\n%s", node.Host, timeout, lastOutput, diag)
+}
+
+func (m *PatroniManager) resetSingleNodeEtcd(node *config.NodeConfig) error {
+	m.logger.Info("Resetting single-node etcd environment",
+		logger.Fields{"node": node.Host})
+
+	cmd := `
+set -e
+systemctl stop etcd 2>/dev/null || true
+systemctl disable etcd 2>/dev/null || true
+pkill -9 etcd 2>/dev/null || true
+rm -rf /var/lib/etcd/*
+rm -f /etc/etcd/etcd.yml
+rm -f /etc/systemd/system/etcd.service
+systemctl daemon-reload || true
+`
+	result := m.executor.RunOnNode(&executor.Node{
+		ID:   node.Host,
+		Host: node.Host,
+		User: m.config.SSHUser,
+	}, cmd, true, false)
+	if result.Error != nil {
+		return result.Error
+	}
+	return nil
+}
+
+func (m *PatroniManager) collectEtcdDiagnostics(node *config.NodeConfig) string {
+	cmd := `
+echo '=== systemctl status etcd ==='
+systemctl status etcd --no-pager -l 2>&1 || true
+echo ''
+echo '=== journalctl -u etcd ==='
+journalctl -u etcd -n 80 --no-pager 2>&1 || true
+echo ''
+echo '=== /etc/etcd/etcd.yml ==='
+cat /etc/etcd/etcd.yml 2>&1 || true
+echo ''
+echo '=== ss -lntp (2379/2380) ==='
+ss -lntp 2>/dev/null | grep -E '2379|2380' || true
+`
+	result := m.executor.RunOnNode(&executor.Node{
+		ID:   node.Host,
+		Host: node.Host,
+		User: m.config.SSHUser,
+	}, cmd, true, true)
+	return strings.TrimSpace(result.Output)
 }
 
 func (m *PatroniManager) waitForPatroniCluster(timeout time.Duration) error {
@@ -607,46 +751,62 @@ func (m *PatroniManager) GetClusterMembers() (*PatroniClusterMembers, error) {
 		return nil, fmt.Errorf("no nodes available")
 	}
 
-	// 使用第一个节点查询集群状态
-	node := m.nodes[0]
-	cmd := fmt.Sprintf("patronictl -c /etc/patroni/%s.yml list", node.Name)
-
-	result := m.executor.RunOnNode(&executor.Node{
-		ID:   node.Host,
-		Host: node.Host,
-		User: m.config.SSHUser,
-	}, cmd, false, false)
-
-	if result.Error != nil {
-		return nil, fmt.Errorf("failed to get cluster members: %w", result.Error)
-	}
-
-	// 解析结果
 	members := &PatroniClusterMembers{
 		Members: make([]ClusterMember, 0),
 	}
 
-	lines := strings.Split(result.Output, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "+") || strings.Contains(line, "Cluster") || strings.Contains(line, "Member") {
+	var lastErr error
+	for _, node := range m.nodes {
+		member, err := m.getPatroniMemberFromAPI(node)
+		if err != nil {
+			lastErr = err
 			continue
 		}
-		if strings.Contains(line, "|") {
-			parts := strings.Split(line, "|")
-			if len(parts) >= 5 {
-				member := ClusterMember{
-					Name:  strings.TrimSpace(parts[1]),
-					Host:  strings.TrimSpace(parts[2]),
-					Role:  strings.TrimSpace(parts[3]),
-					State: strings.TrimSpace(parts[4]),
-				}
-				members.Members = append(members.Members, member)
-			}
+		members.Members = append(members.Members, *member)
+	}
+
+	if len(members.Members) == 0 {
+		if lastErr != nil {
+			return nil, fmt.Errorf("failed to get cluster members from Patroni API: %w", lastErr)
 		}
+		return nil, fmt.Errorf("failed to get cluster members from Patroni API")
 	}
 
 	return members, nil
+}
+
+func (m *PatroniManager) getPatroniMemberFromAPI(node *config.NodeConfig) (*ClusterMember, error) {
+	restPort := m.getRestPort(node)
+	cmd := fmt.Sprintf("curl -sf http://127.0.0.1:%d/patroni", restPort)
+	result := m.executor.RunOnNode(&executor.Node{
+		ID:   node.Host,
+		Host: node.Host,
+		User: m.config.SSHUser,
+	}, cmd, false, true)
+	if result.Error != nil {
+		return nil, result.Error
+	}
+
+	var payload struct {
+		Name  string `json:"name"`
+		Role  string `json:"role"`
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(result.Output)), &payload); err != nil {
+		return nil, fmt.Errorf("invalid patroni api response on %s: %w", node.Host, err)
+	}
+
+	name := payload.Name
+	if name == "" {
+		name = node.Name
+	}
+
+	return &ClusterMember{
+		Name:  name,
+		Host:  node.Host,
+		Role:  strings.ToLower(strings.TrimSpace(payload.Role)),
+		State: strings.ToLower(strings.TrimSpace(payload.State)),
+	}, nil
 }
 
 // PatroniClusterMembers Patroni集群成员
@@ -720,7 +880,7 @@ func (m *PatroniManager) GetClusterHealth() (*PatroniHealth, error) {
 		if member.State == "running" || member.State == "streaming" {
 			health.HealthyMembers++
 		}
-		if member.Role == "leader" {
+		if isLeaderRole(member.Role) {
 			health.Leader = member.Name
 		}
 	}
@@ -728,6 +888,15 @@ func (m *PatroniManager) GetClusterHealth() (*PatroniHealth, error) {
 	health.Healthy = health.HealthyMembers == health.TotalMembers
 
 	return health, nil
+}
+
+func isLeaderRole(role string) bool {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "leader", "primary", "master", "standby_leader":
+		return true
+	default:
+		return false
+	}
 }
 
 // PatroniHealth Patroni集群健康状态

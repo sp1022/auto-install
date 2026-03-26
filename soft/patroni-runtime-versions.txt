@@ -1,0 +1,4 @@
+Python 3.13.12
+patroni[etcd]==4.1.0
+prettytable==3.16.0
+psycopg2-binary==2.9.11

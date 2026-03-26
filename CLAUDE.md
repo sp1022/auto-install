@@ -98,7 +98,6 @@ group_0: 0|patroni0|master|192.168.1.10:5432:/data/pgdata::::1,192.168.1.11:5432
 
 ### 目录结构
 
-- `patroni/`: Patroni YAML 配置示例（g000-g003）
 - `prepare_distribute.sh`: 分发包打包脚本
 - `scripts/test-integration.sh`: 集成测试脚本
 - `deploy.conf`: 生成的配置文件（不在仓库中）

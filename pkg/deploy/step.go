@@ -108,18 +108,21 @@ func (s *PrepareDirectoriesStep) prepareCommand(node *config.NodeConfig) string 
 	if node.DataDir != "" {
 		commands = append(commands, fmt.Sprintf("mkdir -p %s", node.DataDir))
 		commands = append(commands, fmt.Sprintf("chown -R postgres:postgres %s", node.DataDir))
+		commands = append(commands, fmt.Sprintf("chmod 0700 %s", node.DataDir))
 	}
 
 	// 4. 创建 WAL 目录
 	if node.WALDir != "" {
 		commands = append(commands, fmt.Sprintf("mkdir -p %s", node.WALDir))
 		commands = append(commands, fmt.Sprintf("chown -R postgres:postgres %s", node.WALDir))
+		commands = append(commands, fmt.Sprintf("chmod 0700 %s", node.WALDir))
 	}
 
 	// 5. 创建日志目录
 	if node.PGLogDir != "" {
 		commands = append(commands, fmt.Sprintf("mkdir -p %s", node.PGLogDir))
 		commands = append(commands, fmt.Sprintf("chown -R postgres:postgres %s", node.PGLogDir))
+		commands = append(commands, fmt.Sprintf("chmod 0755 %s", node.PGLogDir))
 	}
 
 	return strings.Join(commands, " && ")
@@ -135,9 +138,8 @@ func (s *PrepareDirectoriesStep) IsCompleted(ctx *Context) (bool, error) {
 			continue
 		}
 
-		// 在本地或远程检查目录
-		// 使用 ls -ld 获取目录所有者,更兼容不同系统
-		cmd := fmt.Sprintf("test -d %s && ls -ld %s | awk '{print $3}' | grep -q postgres", node.DataDir, node.DataDir)
+		// 数据目录除了属主，还必须满足 PostgreSQL 要求的 0700/0750 权限。
+		cmd := fmt.Sprintf("test -d %s && stat -c '%%U:%%a' %s | grep -Eq '^postgres:(700|750)$'", node.DataDir, node.DataDir)
 		result := ctx.Executor.RunOnNode(&executor.Node{
 			ID:   node.Host,
 			Host: node.Host,
@@ -733,9 +735,6 @@ func (s *ConfigurePostgreSQLStep) generateConfig(ctx *Context, node *config.Node
 	// 共享库预加载（支持扩展）
 	cfg = append(cfg, "\n# SHARED PRELOAD LIBRARIES")
 	var sharedLibs []string
-	if ctx.Config.DeployMode == config.ModePatroni {
-		sharedLibs = append(sharedLibs, "patroni")
-	}
 	if ctx.Config.DeployMode == config.ModeCitus {
 		sharedLibs = append(sharedLibs, "citus")
 	}

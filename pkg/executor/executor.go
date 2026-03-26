@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -130,6 +131,7 @@ func (e *Executor) lookPath(cmd string) (string, error) {
 // RunOnNode 在单个节点上执行命令
 func (e *Executor) RunOnNode(node *Node, command string, useSudo bool, suppressLog bool) *Result {
 	start := time.Now()
+	command = strings.TrimSpace(command)
 
 	result := &Result{
 		Node:        node,
@@ -145,14 +147,15 @@ func (e *Executor) RunOnNode(node *Node, command string, useSudo bool, suppressL
 		// 本机直接执行命令
 		actualCmd = command
 		if useSudo {
-			actualCmd = fmt.Sprintf("sudo %s", command)
+			actualCmd = fmt.Sprintf("sudo sh -c %s", shellQuote(command))
 		}
 
 		e.logger.Debug("Executing command on local node",
 			logger.Fields{
-				"node": node.ID,
-				"host": node.Host,
-				"cmd":  command,
+				"node":        node.ID,
+				"host":        node.Host,
+				"cmd_preview": formatCommandForLog(command),
+				"cmd_lines":   commandLineCount(command),
 			})
 	} else {
 		// 远程节点通过SSH执行
@@ -166,9 +169,10 @@ func (e *Executor) RunOnNode(node *Node, command string, useSudo bool, suppressL
 
 		e.logger.Debug("Executing command on remote node",
 			logger.Fields{
-				"node": node.ID,
-				"host": node.Host,
-				"cmd":  command,
+				"node":        node.ID,
+				"host":        node.Host,
+				"cmd_preview": formatCommandForLog(command),
+				"cmd_lines":   commandLineCount(command),
 			})
 	}
 
@@ -225,12 +229,13 @@ func (e *Executor) RunOnNode(node *Node, command string, useSudo bool, suppressL
 		if !result.SuppressLog {
 			e.logger.Error("Command failed on node",
 				logger.Fields{
-					"node":      node.ID,
-					"host":      node.Host,
-					"cmd":       command,
-					"exit_code": result.ExitCode,
-					"error":     err,
-					"output":    result.Output,
+					"node":        node.ID,
+					"host":        node.Host,
+					"cmd_preview": formatCommandForLog(command),
+					"cmd_lines":   commandLineCount(command),
+					"exit_code":   result.ExitCode,
+					"error":       err,
+					"output":      result.Output,
 				})
 		}
 	} else {
@@ -249,6 +254,7 @@ func (e *Executor) RunOnNode(node *Node, command string, useSudo bool, suppressL
 // RunOnNodeStreaming 在单个节点上执行命令并实时流式输出日志
 func (e *Executor) RunOnNodeStreaming(node *Node, command string, useSudo bool, outputCallback func(line string)) *Result {
 	start := time.Now()
+	command = strings.TrimSpace(command)
 
 	result := &Result{
 		Node:        node,
@@ -263,7 +269,7 @@ func (e *Executor) RunOnNodeStreaming(node *Node, command string, useSudo bool, 
 	if isLocal {
 		actualCmd = command
 		if useSudo {
-			actualCmd = fmt.Sprintf("sudo %s", command)
+			actualCmd = fmt.Sprintf("sudo sh -c %s", shellQuote(command))
 		}
 		e.logger.Debug("Executing streaming command on local node",
 			logger.Fields{"node": node.ID, "host": node.Host})
@@ -375,6 +381,7 @@ func (e *Executor) RunOnNodeStreaming(node *Node, command string, useSudo bool, 
 // buildSSHCommand 构建 SSH 命令字符串
 func (e *Executor) buildSSHCommand(node *Node, command string, useSudo bool) (string, error) {
 	var parts []string
+	command = strings.TrimSpace(command)
 
 	// sshpass 前缀（密码认证）
 	if node.Password != "" {
@@ -408,7 +415,7 @@ func (e *Executor) buildSSHCommand(node *Node, command string, useSudo bool) (st
 	// 单引号内的一切都是字面量，不需要转义
 	remoteCmd := command
 	if useSudo {
-		remoteCmd = fmt.Sprintf("sudo %s", command)
+		remoteCmd = fmt.Sprintf("sudo sh -c %s", shellQuote(command))
 	}
 
 	// 如果命令中包含单引号，需要特殊处理
@@ -430,9 +437,10 @@ func (e *Executor) RunOnAllNodes(command string, useSudo bool) []*Result {
 func (e *Executor) RunOnNodes(nodes []*Node, command string, useSudo bool) []*Result {
 	e.logger.Info("Executing command on multiple nodes",
 		logger.Fields{
-			"node_count": len(nodes),
-			"cmd":        command,
-			"max_conc":   e.maxConcurrent,
+			"node_count":  len(nodes),
+			"cmd_preview": formatCommandForLog(command),
+			"cmd_lines":   commandLineCount(command),
+			"max_conc":    e.maxConcurrent,
 		})
 
 	results := make([]*Result, len(nodes))
@@ -462,8 +470,9 @@ func (e *Executor) RunOnNodes(nodes []*Node, command string, useSudo bool) []*Re
 func (e *Executor) RunSequential(nodes []*Node, command string, useSudo bool) []*Result {
 	e.logger.Info("Executing command sequentially",
 		logger.Fields{
-			"node_count": len(nodes),
-			"cmd":        command,
+			"node_count":  len(nodes),
+			"cmd_preview": formatCommandForLog(command),
+			"cmd_lines":   commandLineCount(command),
 		})
 
 	results := make([]*Result, len(nodes))
@@ -482,6 +491,48 @@ func (e *Executor) RunSequential(nodes []*Node, command string, useSudo bool) []
 	}
 
 	return results
+}
+
+func commandLineCount(command string) int {
+	count := 0
+	for _, line := range strings.Split(strings.TrimSpace(command), "\n") {
+		if strings.TrimSpace(line) != "" {
+			count++
+		}
+	}
+	return count
+}
+
+func formatCommandForLog(command string) string {
+	lines := strings.Split(strings.TrimSpace(command), "\n")
+	formatted := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		formatted = append(formatted, line)
+	}
+
+	if len(formatted) == 0 {
+		return ""
+	}
+
+	const maxLines = 8
+	const maxLineWidth = 120
+	preview := make([]string, 0, min(len(formatted), maxLines)+1)
+	for i, line := range formatted {
+		if i == maxLines {
+			preview = append(preview, "...+"+strconv.Itoa(len(formatted)-maxLines)+" more lines")
+			break
+		}
+		if len(line) > maxLineWidth {
+			line = line[:maxLineWidth-3] + "..."
+		}
+		preview = append(preview, strconv.Itoa(i+1)+". "+line)
+	}
+
+	return strings.Join(preview, "\n")
 }
 
 // CopyFile 将文件复制到节点

@@ -29,11 +29,36 @@ func Execute(log *logger.Logger) error {
 func NewRootCommand(log *logger.Logger) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "pg-deploy",
-		Short: "PostgreSQL 自动化部署工具",
-		Long: `pg-deploy 是一款功能强大的 PostgreSQL 自动化部署工具
-支持单机、主从、Patroni 高可用、Citus 分布式四种部署模式
-适用于 10-50 节点的生产环境`,
-		Version: "2.0.0-alpha",
+		Short: "PostgreSQL 自动化部署与重建工具",
+		Long: `pg-deploy 用于批量部署、验证、销毁和重建 PostgreSQL 环境。
+
+支持模式：
+  - standalone   单机部署
+  - master-slave 主从复制
+  - patroni      Patroni + etcd 高可用
+  - citus        Citus 分布式集群
+
+典型用途：
+  - 用统一配置文件管理多节点 PostgreSQL 环境
+  - 在测试环境中反复执行 destroy + redeploy
+  - 通过 validate 预检查 SSH 和 PostgreSQL 连通性
+  - 通过 env 子命令查看和清理当前配置对应的环境`,
+		Example: `  # 查看全部命令
+  pg-deploy --help
+
+  # 查看某个子命令的详细帮助
+  pg-deploy deploy --help
+  pg-deploy env destroy --help
+
+  # 验证环境
+  pg-deploy validate -c deploy.conf --ssh-only
+
+  # 正式部署
+  pg-deploy deploy -c deploy.conf
+
+  # 先销毁再重建
+  pg-deploy deploy -c deploy.conf --destroy-first --yes`,
+		Version: "2.0.0",
 	}
 
 	// 全局标志

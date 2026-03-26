@@ -9,7 +9,7 @@
 
 ### 2. Patroni 模式独立配置
 **新增功能:**
-- 创建独立的 `patroni.conf` 配置文件
+- 创建独立的 `examples/patroni/patroni.conf` 配置文件
 - 支持配置化的 Patroni 模板
 - 添加 `PatroniConfig` 结构体
 - 实现 `loadPatroniConfig()` 函数
@@ -36,9 +36,9 @@ citus_database: "postgres"
 
 ### 3. 配置文件示例
 **新增文件:**
-- `patroni.conf` - Patroni 配置文件
-- `patroni.conf.example` - Patroni 配置示例
-- `deploy-patroni.conf` - Patroni 模式部署配置示例
+- `examples/patroni/patroni.conf` - Patroni 配置文件
+- `examples/patroni/patroni.conf.example` - Patroni 配置示例
+- `examples/patroni/deploy-patroni.conf` - Patroni 模式部署配置示例
 - `docs/USER_MANUAL.md` - 当前使用手册
 
 ### 4. 测试工具
@@ -89,9 +89,9 @@ vim deploy.conf
 
 ### Patroni 模式部署
 ```bash
-# 1. 编辑 deploy-patroni.conf 和 patroni.conf
-vim deploy-patroni.conf
-vim patroni.conf
+# 1. 编辑 examples/patroni/deploy-patroni.conf 和 Patroni 参数模板
+vim examples/patroni/deploy-patroni.conf
+vim examples/patroni/patroni.conf
 
 # 2. 运行部署
 ./pg-deploy
@@ -116,7 +116,7 @@ pg_soft_dir: /usr/local/pgsql
 group_0: 0|groupname|role|ip:port:data_dir:wal_dir:pglog_dir:is_master,...
 ```
 
-### patroni.conf
+### examples/patroni/patroni.conf
 ```yaml
 # etcd 配置
 etcd_hosts: "host1:2379,host2:2379,host3:2379"

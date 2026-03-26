@@ -21,11 +21,18 @@ func NewCommand(log *logger.Logger) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "validate",
-		Short: "验证部署环境和连接",
-		Long: `验证 PostgreSQL 部署环境和连接状态：
-  - SSH 连接测试
-  - PostgreSQL 凭证验证
-  - 部署环境预检查`,
+		Short: "验证配置、SSH 和 PostgreSQL 连通性",
+		Long: `validate 用于在正式部署前快速发现配置和连通性问题。
+
+默认会执行：
+  - 配置文件加载
+  - SSH 登录验证
+  - PostgreSQL 凭证与端口验证
+
+适用场景：
+  - 首次部署前确认网络和账号是否可用
+  - 重建前确认节点仍可通过 SSH 管理
+  - Patroni / 主从环境部署后做基础连通性检查`,
 		Example: `  # 验证配置（SSH + PostgreSQL）
   pg-deploy validate -c deploy.conf
 
@@ -130,8 +137,8 @@ func NewCommand(log *logger.Logger) *cobra.Command {
 	}
 
 	cmd.Flags().StringVarP(&configFile, "config", "c", "", "配置文件路径")
-	cmd.Flags().BoolVar(&showDetails, "details", false, "显示详细信息")
-	cmd.Flags().BoolVar(&sshOnly, "ssh-only", false, "仅验证 SSH 连接（不验证 PostgreSQL）")
+	cmd.Flags().BoolVar(&showDetails, "details", false, "显示每个节点的 SSH / PostgreSQL 明细和错误")
+	cmd.Flags().BoolVar(&sshOnly, "ssh-only", false, "仅验证 SSH 连接，不检查 PostgreSQL 端口和凭证")
 
 	return cmd
 }

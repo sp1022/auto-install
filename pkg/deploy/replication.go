@@ -2,9 +2,13 @@
 package deploy
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"crypto/rand"
 	"fmt"
+	"io"
 	"math/big"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -417,12 +421,52 @@ func NewInstallPatroniStep() *InstallPatroniStep {
 // Execute 执行安装
 func (s *InstallPatroniStep) Execute(ctx *Context) error {
 	nodes := uniqueNodesByHost(ctx.Config.GetAllNodes(), ctx.Config.SSHUser, ctx.Config.SSHPassword)
-
 	ctx.Logger.Info("Installing Patroni on all nodes",
 		logger.Fields{"node_count": len(nodes)})
 
-	cmd := `
+	if ctx.Config.PatroniPackage != "" {
+		ctx.Logger.Info("Installing Patroni from offline package",
+			logger.Fields{"package": ctx.Config.PatroniPackage})
+		if err := installRuntimeBundle(ctx, nodes, ctx.Config.PatroniPackage, "/opt/pg-deploy/patroni-runtime", "patroni", []string{
+			"chown -R root:root /opt/pg-deploy/patroni-runtime",
+			"chmod -R a+rX /opt/pg-deploy/patroni-runtime",
+			"test -x /opt/pg-deploy/patroni-runtime/bin/python3",
+			"test -x /opt/pg-deploy/patroni-runtime/bin/patroni",
+			"test -x /opt/pg-deploy/patroni-runtime/bin/patronictl",
+			validatePatroniRuntimeShell("/opt/pg-deploy/patroni-runtime"),
+			"ln -sfn /opt/pg-deploy/patroni-runtime/bin/python3 /usr/local/bin/python3",
+			"ln -sfn /opt/pg-deploy/patroni-runtime/bin/patroni /usr/local/bin/patroni",
+			"ln -sfn /opt/pg-deploy/patroni-runtime/bin/patronictl /usr/local/bin/patronictl",
+		}); err != nil {
+			return fmt.Errorf("failed to install patroni offline package: %w", err)
+		}
+	}
+
+	if ctx.Config.PatroniWheelhouse != "" {
+		ctx.Logger.Info("Installing Patroni from offline wheelhouse",
+			logger.Fields{"package": ctx.Config.PatroniWheelhouse})
+		if err := installPatroniWheelhouse(ctx, nodes, ctx.Config.PatroniWheelhouse); err != nil {
+			return fmt.Errorf("failed to install patroni wheelhouse: %w", err)
+		}
+	}
+
+	if ctx.Config.EtcdPackage != "" {
+		ctx.Logger.Info("Installing etcd from offline package",
+			logger.Fields{"package": ctx.Config.EtcdPackage, "node_count": len(nodes)})
+		if err := installRuntimeBundle(ctx, nodes, ctx.Config.EtcdPackage, "/opt/pg-deploy/etcd-runtime", "etcd", []string{
+			normalizeEtcdRuntimeShell("/opt/pg-deploy/etcd-runtime"),
+			"test -x /opt/pg-deploy/etcd-runtime/bin/etcd",
+			"test -x /opt/pg-deploy/etcd-runtime/bin/etcdctl",
+			"ln -sfn /opt/pg-deploy/etcd-runtime/bin/etcd /usr/local/bin/etcd",
+			"ln -sfn /opt/pg-deploy/etcd-runtime/bin/etcdctl /usr/local/bin/etcdctl",
+		}); err != nil {
+			return fmt.Errorf("failed to install etcd offline package: %w", err)
+		}
+	}
+
+	cmd := fmt.Sprintf(`
 set -e
+if ! command -v patroni >/dev/null 2>&1 || ! command -v patronictl >/dev/null 2>&1; then
 if command -v apt-get >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
@@ -436,8 +480,12 @@ elif command -v zypper >/dev/null 2>&1; then
 elif command -v apk >/dev/null 2>&1; then
   apk add --no-cache python3 py3-pip curl
 fi
-python3 -m pip install --upgrade pip
-python3 -m pip install patroni[etcd] psycopg2-binary
+rm -rf /opt/pg-deploy/patroni-venv
+python3 -m venv /opt/pg-deploy/patroni-venv
+/opt/pg-deploy/patroni-venv/bin/pip install --upgrade pip
+/opt/pg-deploy/patroni-venv/bin/pip install 'patroni[etcd]==4.1.0' 'prettytable==3.16.0' 'psycopg2-binary==2.9.11'
+%s
+fi
 if ! command -v etcd >/dev/null 2>&1 || ! command -v etcdctl >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1; then
     apt-get install -y etcd-server etcd-client
@@ -455,7 +503,7 @@ command -v patroni >/dev/null 2>&1
 command -v patronictl >/dev/null 2>&1
 command -v etcd >/dev/null 2>&1
 command -v etcdctl >/dev/null 2>&1
-`
+`, patroniCtlCompatShell("/opt/pg-deploy/patroni-venv"))
 
 	results := ctx.Executor.RunOnNodes(nodes, cmd, true)
 
@@ -475,6 +523,14 @@ command -v etcdctl >/dev/null 2>&1
 
 	// 如果有任何节点失败，返回错误
 	if len(failedNodes) > 0 {
+		for _, result := range results {
+			if result != nil && strings.Contains(result.Output, "dpkg was interrupted") {
+				return fmt.Errorf("failed to install Patroni on nodes %v: apt/dpkg is broken on %s, run 'dpkg --configure -a' and retry", failedNodes, result.Node.ID)
+			}
+			if result != nil && strings.Contains(result.Output, "externally-managed-environment") {
+				return fmt.Errorf("failed to install Patroni on nodes %v: Debian system Python is externally managed on %s, use the venv-enabled binary or upgrade pg-deploy", failedNodes, result.Node.ID)
+			}
+		}
 		return fmt.Errorf("failed to install Patroni on %d node(s): %v",
 			len(failedNodes), failedNodes)
 	}
@@ -484,7 +540,7 @@ command -v etcdctl >/dev/null 2>&1
 
 // IsCompleted 检查Patroni是否已安装
 func (s *InstallPatroniStep) IsCompleted(ctx *Context) (bool, error) {
-	cmd := "python3 -c 'import patroni; print(patroni.__version__)' && command -v etcd >/dev/null 2>&1 && command -v etcdctl >/dev/null 2>&1"
+	cmd := "command -v patroni >/dev/null 2>&1 && command -v patronictl >/dev/null 2>&1"
 
 	nodes := uniqueConfigNodesByHost(ctx.Config.GetAllNodes())
 	for _, node := range nodes {
@@ -492,14 +548,408 @@ func (s *InstallPatroniStep) IsCompleted(ctx *Context) (bool, error) {
 			ID:   node.Host,
 			Host: node.Host,
 			User: ctx.Config.SSHUser,
-		}, cmd, false, false)
+		}, cmd, false, true)
 
 		if result.Error != nil {
 			return false, nil
 		}
 	}
 
+	for _, node := range selectPatroniEtcdNodes(ctx.Config) {
+		result := ctx.Executor.RunOnNode(node, "command -v etcd >/dev/null 2>&1 && command -v etcdctl >/dev/null 2>&1", false, true)
+		if result.Error != nil {
+			return false, nil
+		}
+	}
+
 	return true, nil
+}
+
+func selectPatroniEtcdNodes(cfg *config.Config) []*executor.Node {
+	seen := make(map[string]bool)
+	nodes := make([]*executor.Node, 0, 3)
+	for _, node := range cfg.GetAllNodes() {
+		if seen[node.Host] {
+			continue
+		}
+		seen[node.Host] = true
+		nodes = append(nodes, &executor.Node{
+			ID:       node.Host,
+			Host:     node.Host,
+			User:     cfg.SSHUser,
+			Password: cfg.SSHPassword,
+		})
+		if len(nodes) == 3 {
+			break
+		}
+	}
+	return nodes
+}
+
+func installRuntimeBundle(ctx *Context, nodes []*executor.Node, localPackage, installDir, bundleKind string, postExtractCommands []string) error {
+	if len(nodes) == 0 {
+		return nil
+	}
+
+	stagedArtifact, cleanup, err := prepareRuntimeArtifact(localPackage, bundleKind)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	remotePackage := filepath.Join("/tmp", filepath.Base(stagedArtifact))
+	if err := stageFileToNodes(ctx, nodes, stagedArtifact, remotePackage); err != nil {
+		return err
+	}
+
+	installCmd := fmt.Sprintf(`
+set -e
+mkdir -p %s
+rm -rf %s/*
+tar -xzf %s -C %s
+%s
+`, shellValue(installDir), shellValue(installDir), shellValue(remotePackage), shellValue(installDir), strings.Join(postExtractCommands, "\n"))
+
+	results := ctx.Executor.RunOnNodes(nodes, installCmd, true)
+	var failedNodes []string
+	for _, result := range results {
+		if result.Error != nil {
+			failedNodes = append(failedNodes, result.Node.ID)
+		}
+	}
+	if len(failedNodes) > 0 {
+		return fmt.Errorf("bundle install failed on nodes: %v", failedNodes)
+	}
+
+	cleanupCmd := fmt.Sprintf("rm -f %s", shellValue(remotePackage))
+	for _, node := range nodes {
+		ctx.Executor.RunOnNode(node, cleanupCmd, true, true)
+	}
+	return nil
+}
+
+func prepareRuntimeArtifact(localArtifact, bundleKind string) (string, func(), error) {
+	info, err := os.Stat(localArtifact)
+	if err != nil {
+		return "", func() {}, fmt.Errorf("failed to stat runtime artifact %s: %w", localArtifact, err)
+	}
+
+	if !info.IsDir() {
+		return localArtifact, func() {}, nil
+	}
+
+	tempFile, err := os.CreateTemp("", "pg-deploy-runtime-*.tar.gz")
+	if err != nil {
+		return "", func() {}, fmt.Errorf("failed to create temporary runtime archive: %w", err)
+	}
+	tempPath := tempFile.Name()
+	tempFile.Close()
+
+	if err := archiveRuntimeSource(localArtifact, tempPath, bundleKind); err != nil {
+		os.Remove(tempPath)
+		return "", func() {}, err
+	}
+
+	return tempPath, func() { _ = os.Remove(tempPath) }, nil
+}
+
+func archiveRuntimeSource(sourceDir, outputPath, bundleKind string) error {
+	if hasBinLayout(sourceDir, bundleKind) {
+		return archiveDirectoryAsTarGz(sourceDir, outputPath)
+	}
+	return archiveFlatRuntimeAsTarGz(sourceDir, outputPath, bundleKind)
+}
+
+func hasBinLayout(sourceDir, bundleKind string) bool {
+	var required []string
+	switch bundleKind {
+	case "patroni":
+		required = []string{"bin/python3", "bin/patroni", "bin/patronictl"}
+	case "etcd":
+		required = []string{"bin/etcd", "bin/etcdctl"}
+	default:
+		return false
+	}
+
+	for _, rel := range required {
+		info, err := os.Stat(filepath.Join(sourceDir, filepath.FromSlash(rel)))
+		if err != nil || info.IsDir() {
+			return false
+		}
+	}
+	return true
+}
+
+func archiveDirectoryAsTarGz(sourceDir, outputPath string) error {
+	out, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create archive %s: %w", outputPath, err)
+	}
+	defer out.Close()
+
+	gz := gzip.NewWriter(out)
+	defer gz.Close()
+
+	tw := tar.NewWriter(gz)
+	defer tw.Close()
+
+	return filepath.Walk(sourceDir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == sourceDir {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(sourceDir, path)
+		if err != nil {
+			return fmt.Errorf("failed to build relative path for %s: %w", path, err)
+		}
+
+		header, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return fmt.Errorf("failed to create tar header for %s: %w", path, err)
+		}
+		header.Name = filepath.ToSlash(relPath)
+		if info.IsDir() {
+			header.Name += "/"
+		}
+
+		if err := tw.WriteHeader(header); err != nil {
+			return fmt.Errorf("failed to write tar header for %s: %w", path, err)
+		}
+
+		if info.IsDir() {
+			return nil
+		}
+
+		file, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("failed to open %s for archiving: %w", path, err)
+		}
+		defer file.Close()
+
+		if _, err := io.Copy(tw, file); err != nil {
+			return fmt.Errorf("failed to archive %s: %w", path, err)
+		}
+		return nil
+	})
+}
+
+func archiveFlatRuntimeAsTarGz(sourceDir, outputPath, bundleKind string) error {
+	out, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create archive %s: %w", outputPath, err)
+	}
+	defer out.Close()
+
+	gz := gzip.NewWriter(out)
+	defer gz.Close()
+
+	tw := tar.NewWriter(gz)
+	defer tw.Close()
+
+	var entries map[string]string
+	switch bundleKind {
+	case "patroni":
+		entries = map[string]string{
+			"bin/python3":    filepath.Join(sourceDir, "python3"),
+			"bin/patroni":    filepath.Join(sourceDir, "patroni"),
+			"bin/patronictl": filepath.Join(sourceDir, "patronictl"),
+		}
+	case "etcd":
+		entries = map[string]string{
+			"bin/etcd":    filepath.Join(sourceDir, "etcd"),
+			"bin/etcdctl": filepath.Join(sourceDir, "etcdctl"),
+		}
+	default:
+		return fmt.Errorf("unsupported runtime bundle kind: %s", bundleKind)
+	}
+
+	for archivePath, sourcePath := range entries {
+		if err := addFileToTarWriter(tw, sourcePath, archivePath); err != nil {
+			return err
+		}
+	}
+
+	if bundleKind == "patroni" {
+		for _, rel := range []string{"lib", "site-packages"} {
+			candidate := filepath.Join(sourceDir, rel)
+			info, err := os.Stat(candidate)
+			if err == nil && info.IsDir() {
+				target := rel
+				if rel == "site-packages" {
+					target = "lib/site-packages"
+				}
+				if err := addPathToTarWriter(tw, candidate, target); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func addPathToTarWriter(tw *tar.Writer, sourcePath, archiveBase string) error {
+	return filepath.Walk(sourcePath, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relPath, err := filepath.Rel(sourcePath, path)
+		if err != nil {
+			return fmt.Errorf("failed to build relative path for %s: %w", path, err)
+		}
+		archivePath := archiveBase
+		if relPath != "." {
+			archivePath = filepath.ToSlash(filepath.Join(archiveBase, relPath))
+		}
+		if info.IsDir() {
+			return writeTarHeader(tw, info, archivePath+"/")
+		}
+		return addFileToTarWriter(tw, path, archivePath)
+	})
+}
+
+func addFileToTarWriter(tw *tar.Writer, sourcePath, archivePath string) error {
+	info, err := os.Stat(sourcePath)
+	if err != nil {
+		return fmt.Errorf("required runtime file not found %s: %w", sourcePath, err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("expected file but got directory: %s", sourcePath)
+	}
+	if err := writeTarHeader(tw, info, filepath.ToSlash(archivePath)); err != nil {
+		return err
+	}
+	file, err := os.Open(sourcePath)
+	if err != nil {
+		return fmt.Errorf("failed to open %s for archiving: %w", sourcePath, err)
+	}
+	defer file.Close()
+	if _, err := io.Copy(tw, file); err != nil {
+		return fmt.Errorf("failed to archive %s: %w", sourcePath, err)
+	}
+	return nil
+}
+
+func writeTarHeader(tw *tar.Writer, info os.FileInfo, archivePath string) error {
+	header, err := tar.FileInfoHeader(info, "")
+	if err != nil {
+		return fmt.Errorf("failed to create tar header for %s: %w", archivePath, err)
+	}
+	header.Name = archivePath
+	if err := tw.WriteHeader(header); err != nil {
+		return fmt.Errorf("failed to write tar header for %s: %w", archivePath, err)
+	}
+	return nil
+}
+
+func stageFileToNodes(ctx *Context, nodes []*executor.Node, localPath, remotePath string) error {
+	var remoteNodes []*executor.Node
+	for _, node := range nodes {
+		if ctx.Executor.IsLocalNode(node.Host) {
+			cmd := fmt.Sprintf("mkdir -p %s && cp %s %s",
+				shellValue(filepath.Dir(remotePath)), shellValue(localPath), shellValue(remotePath))
+			result := ctx.Executor.RunOnNode(node, cmd, false, false)
+			if result.Error != nil {
+				return fmt.Errorf("failed to stage local file to %s: %w", node.Host, result.Error)
+			}
+			continue
+		}
+		remoteNodes = append(remoteNodes, node)
+	}
+
+	if len(remoteNodes) == 0 {
+		return nil
+	}
+
+	results := ctx.Executor.CopyFile(localPath, remotePath, remoteNodes)
+	var failedNodes []string
+	for _, result := range results {
+		if result.Error != nil {
+			failedNodes = append(failedNodes, result.Node.ID)
+		}
+	}
+	if len(failedNodes) > 0 {
+		return fmt.Errorf("failed to copy file to nodes: %v", failedNodes)
+	}
+	return nil
+}
+
+func shellValue(v string) string {
+	return "'" + strings.ReplaceAll(v, "'", "'\\''") + "'"
+}
+
+func normalizeEtcdRuntimeShell(installDir string) string {
+	quotedDir := shellValue(installDir)
+	return fmt.Sprintf(`
+mkdir -p %s/bin
+if [ ! -x %s/bin/etcd ]; then
+  found_etcd="$(find %s -maxdepth 3 -type f -name etcd | head -n 1)"
+  [ -n "$found_etcd" ] && install -m 755 "$found_etcd" %s/bin/etcd
+fi
+if [ ! -x %s/bin/etcdctl ]; then
+  found_etcdctl="$(find %s -maxdepth 3 -type f -name etcdctl | head -n 1)"
+  [ -n "$found_etcdctl" ] && install -m 755 "$found_etcdctl" %s/bin/etcdctl
+fi
+`, quotedDir, quotedDir, quotedDir, quotedDir, quotedDir, quotedDir, quotedDir)
+}
+
+func validatePatroniRuntimeShell(installDir string) string {
+	quotedDir := shellValue(installDir)
+	return fmt.Sprintf(`
+%s/bin/python3 -c "import patroni, patroni.dcs.etcd, patroni.dcs.etcd3" >/dev/null
+`, quotedDir)
+}
+
+func installPatroniWheelhouse(ctx *Context, nodes []*executor.Node, localPackage string) error {
+	remotePackage := filepath.Join("/tmp", filepath.Base(localPackage))
+	if err := stageFileToNodes(ctx, nodes, localPackage, remotePackage); err != nil {
+		return err
+	}
+
+	cmd := fmt.Sprintf(`
+set -e
+if command -v apt-get >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y python3 python3-pip python3-venv
+fi
+mkdir -p /opt/pg-deploy/patroni-wheelhouse
+rm -rf /opt/pg-deploy/patroni-wheelhouse/*
+tar -xzf %s -C /opt/pg-deploy/patroni-wheelhouse
+rm -rf /opt/pg-deploy/patroni-venv
+python3 -m venv /opt/pg-deploy/patroni-venv
+/opt/pg-deploy/patroni-venv/bin/pip install --upgrade pip
+/opt/pg-deploy/patroni-venv/bin/pip install --no-index --find-links=/opt/pg-deploy/patroni-wheelhouse 'patroni[etcd]==4.1.0' 'prettytable==3.16.0' 'psycopg2-binary==2.9.11'
+%s
+command -v patroni >/dev/null 2>&1
+command -v patronictl >/dev/null 2>&1
+`, shellValue(remotePackage), patroniCtlCompatShell("/opt/pg-deploy/patroni-venv"))
+
+	results := ctx.Executor.RunOnNodes(nodes, cmd, true)
+	var failedNodes []string
+	for _, result := range results {
+		if result.Error != nil {
+			failedNodes = append(failedNodes, result.Node.ID)
+		}
+	}
+	if len(failedNodes) > 0 {
+		return fmt.Errorf("wheelhouse install failed on nodes: %v", failedNodes)
+	}
+
+	for _, result := range results {
+		if result != nil && strings.Contains(result.Output, "externally-managed-environment") {
+			return fmt.Errorf("wheelhouse install failed: Debian system Python is externally managed on %s, use the venv-enabled binary or upgrade pg-deploy", result.Node.ID)
+		}
+	}
+
+	cleanupCmd := fmt.Sprintf("rm -f %s", shellValue(remotePackage))
+	for _, node := range nodes {
+		ctx.Executor.RunOnNode(node, cleanupCmd, true, true)
+	}
+	return nil
 }
 
 // ConfigurePatroniStep 配置Patroni步骤
@@ -557,7 +1007,7 @@ func (s *ConfigurePatroniStep) IsCompleted(ctx *Context) (bool, error) {
 			ID:   node.Host,
 			Host: node.Host,
 			User: ctx.Config.SSHUser,
-		}, cmd, false, false)
+		}, cmd, false, true)
 
 		if result.Error != nil {
 			return false, nil
@@ -604,7 +1054,7 @@ func (s *StartPatroniClusterStep) IsCompleted(ctx *Context) (bool, error) {
 			ID:   node.Host,
 			Host: node.Host,
 			User: ctx.Config.SSHUser,
-		}, cmd, false, false)
+		}, cmd, false, true)
 
 		if result.Error != nil || !strings.Contains(result.Output, "active") {
 			return false, nil
@@ -779,6 +1229,40 @@ func uniqueNodesByHost(nodes []*config.NodeConfig, user, password string) []*exe
 	}
 
 	return result
+}
+
+func patroniCtlCompatShell(venvRoot string) string {
+	return fmt.Sprintf(`ctl_py=$(find %s/lib -path '*/site-packages/patroni/ctl.py' | head -n 1 || true)
+if [ -n "$ctl_py" ] && [ -f "$ctl_py" ]; then
+python3 - "$ctl_py" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+content = path.read_text()
+old = "from prettytable import ALL, FRAME, PrettyTable"
+new = """try:
+    from prettytable import HRuleStyle, PrettyTable
+    ALL = HRuleStyle.ALL
+    FRAME = HRuleStyle.FRAME
+except ImportError:
+    from prettytable import ALL, FRAME, PrettyTable"""
+
+if old in content and new not in content:
+    path.write_text(content.replace(old, new, 1))
+PY
+fi
+cat > /usr/local/bin/patroni <<'EOF'
+#!/bin/sh
+export PYTHONWARNINGS="ignore::DeprecationWarning"
+exec %s/bin/patroni "$@"
+EOF
+cat > /usr/local/bin/patronictl <<'EOF'
+#!/bin/sh
+export PYTHONWARNINGS="ignore::DeprecationWarning"
+exec %s/bin/python3 -c 'from patroni.ctl import ctl; ctl()' "$@"
+EOF
+chmod +x /usr/local/bin/patroni /usr/local/bin/patronictl`, shellValue(venvRoot), venvRoot, venvRoot)
 }
 
 func uniqueConfigNodesByHost(nodes []*config.NodeConfig) []*config.NodeConfig {
